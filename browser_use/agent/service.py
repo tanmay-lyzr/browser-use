@@ -5,10 +5,14 @@ import json
 import logging
 import re
 import time
+import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Generic, List, Optional, TypeVar
 
 from dotenv import load_dotenv
+
+
+from openai import OpenAI
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
 	BaseMessage,
@@ -137,6 +141,9 @@ class Agent(Generic[Context]):
 		self.llm = llm
 		self.controller = controller
 		self.sensitive_data = sensitive_data
+
+		# OpenAI Client
+		self.openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 		self.settings = AgentSettings(
 			use_vision=use_vision,
@@ -375,6 +382,7 @@ class Agent(Generic[Context]):
 
 				self._message_manager.add_model_output(model_output)
 			except Exception as e:
+				print(e)
 				# model call failed, remove last state message from history
 				self._message_manager._remove_last_state_message()
 				raise e
@@ -503,41 +511,129 @@ class Agent(Generic[Context]):
 		else:
 			return input_messages
 
+	# @time_execution_async('--get_next_action (agent)')
+	# async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
+	# 	"""Get next action from LLM based on current state"""
+	# 	input_messages = self._convert_input_messages(input_messages)
+	#
+	# 	if self.tool_calling_method == 'raw':
+	# 		output = self.llm.invoke(input_messages)
+	# 		# TODO: currently invoke does not return reasoning_content, we should override invoke
+	# 		output.content = self._remove_think_tags(str(output.content))
+	# 		try:
+	# 			parsed_json = extract_json_from_model_output(output.content)
+	# 			parsed = self.AgentOutput(**parsed_json)
+	# 		except (ValueError, ValidationError) as e:
+	# 			logger.warning(f'Failed to parse model output: {output} {str(e)}')
+	# 			raise ValueError('Could not parse response.')
+	#
+	# 	elif self.tool_calling_method is None:
+	# 		structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
+	# 		response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
+	# 		parsed: AgentOutput | None = response['parsed']
+	# 	else:
+	# 		structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True, method=self.tool_calling_method)
+	# 		response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
+	# 		parsed: AgentOutput | None = response['parsed']
+	#
+	# 	if parsed is None:
+	# 		raise ValueError('Could not parse response.')
+	#
+	# 	# cut the number of actions to max_actions_per_step if needed
+	# 	if len(parsed.action) > self.settings.max_actions_per_step:
+	# 		parsed.action = parsed.action[: self.settings.max_actions_per_step]
+	#
+	# 	log_response(parsed)
+	#
+	# 	return parsed
+
 	@time_execution_async('--get_next_action (agent)')
 	async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
-		"""Get next action from LLM based on current state"""
-		input_messages = self._convert_input_messages(input_messages)
+		"""Get next action from OpenAI based on current state (replacing LangChain calls)"""
+		# Convert our messages to the dict format required by OpenAI
+		messages = []
+		for m in input_messages:
+			if m.__class__.__name__ == "SystemMessage":
+				role = "system"
+			elif m.__class__.__name__ == "HumanMessage":
+				role = "user"
+			elif m.__class__.__name__ == "AIMessage":
+				role = "assistant"
+			else:
+				# fallback or handle ToolMessage differently if needed
+				role = "user"
+			# If your messages can contain lists or other structures, flatten them to strings
+			# or adapt as needed:
+			content_str = m.content if isinstance(m.content, str) else str(m.content)
+			messages.append({"role": role, "content": content_str})
 
 		if self.tool_calling_method == 'raw':
-			output = self.llm.invoke(input_messages)
-			# TODO: currently invoke does not return reasoning_content, we should override invoke
-			output.content = self._remove_think_tags(str(output.content))
+			# Plain call, no function calling
+			response = self.openai_client.chat.completions.create(
+				model=self.model_name,
+				messages=messages,
+			)
+			output_content = response.choices[0].message.content
+			output_content = self._remove_think_tags(str(output_content))
 			try:
-				parsed_json = extract_json_from_model_output(output.content)
+				parsed_json = extract_json_from_model_output(output_content)
 				parsed = self.AgentOutput(**parsed_json)
 			except (ValueError, ValidationError) as e:
-				logger.warning(f'Failed to parse model output: {output} {str(e)}')
+				logger.warning(f'Failed to parse model output: {output_content} {str(e)}')
 				raise ValueError('Could not parse response.')
 
 		elif self.tool_calling_method is None:
-			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
-			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
-			parsed: AgentOutput | None = response['parsed']
+			# Expect a plain JSON output
+			response = self.openai_client.chat.completions.create(
+				model=self.model_name,
+				messages=messages,
+			)
+			output_content = response.choices[0].message.content
+			try:
+				parsed_json = json.loads(output_content)
+				parsed = self.AgentOutput(**parsed_json)
+			except (json.JSONDecodeError, ValidationError) as e:
+				logger.warning(f'Failed to parse model output: {output_content} {str(e)}')
+				raise ValueError('Could not parse response.')
 		else:
-			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True, method=self.tool_calling_method)
-			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
-			parsed: AgentOutput | None = response['parsed']
+			# Use function calling for structured output
+			functions = [{
+				"name": "agent_output",
+				"description": "Structured output for agent actions",
+				"parameters": self.AgentOutput.schema()
+			}]
+			response = self.openai_client.chat.completions.create(
+				model=self.model_name,
+				messages=messages,
+				functions=functions,
+				function_call="auto"
+			)
+			message = response.choices[0].message
+			if message.function_call:
+				function_args = message["function_call"].get("arguments")
+				try:
+					parsed_json = json.loads(function_args)
+					parsed = self.AgentOutput(**parsed_json)
+				except (json.JSONDecodeError, ValidationError) as e:
+					logger.warning(f'Failed to parse function_call output: {function_args} {str(e)}')
+					raise ValueError('Could not parse response.')
+			else:
+				# Fallback if function calling is not triggered
+				output_content = message.content
+				output_content = self._remove_think_tags(str(output_content))
+				try:
+					parsed_json = extract_json_from_model_output(output_content)
+					parsed = self.AgentOutput(**parsed_json)
+				except (ValueError, ValidationError) as e:
+					logger.warning(f'Failed to parse model output: {output_content} {str(e)}')
+					raise ValueError('Could not parse response.')
 
-		if parsed is None:
-			raise ValueError('Could not parse response.')
-
-		# cut the number of actions to max_actions_per_step if needed
 		if len(parsed.action) > self.settings.max_actions_per_step:
 			parsed.action = parsed.action[: self.settings.max_actions_per_step]
 
 		log_response(parsed)
-
 		return parsed
+
 
 	def _log_agent_run(self) -> None:
 		"""Log the agent run"""
